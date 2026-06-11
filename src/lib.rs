@@ -86,13 +86,23 @@ mod tests {
     }
 
     #[test]
-    fn returns_none_when_no_repo_marker_exists() {
+    fn returns_none_when_no_marker_exists() {
         let fixture = Fixture::new("missing");
         let nested = fixture.path.join("a/b/c");
+        let marker = format!(
+            ".definitely-missing-marker-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
 
         fs::create_dir_all(&nested).unwrap();
 
-        assert_eq!(find_repo_root(&nested), None);
+        assert_eq!(
+            find_root(&nested, marker, MarkerKind::FileOrDirectory),
+            None
+        );
     }
 
     #[test]
