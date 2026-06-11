@@ -7,7 +7,8 @@ use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use pulldown_cmark::{html, Options, Parser};
+use merman::render::HeadlessRenderer;
+use pulldown_cmark::{html, CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd};
 
 const DEFAULT_BIND: &str = "127.0.0.1:8000";
 const USAGE: &str = "\
@@ -463,15 +464,7 @@ fn page_title(root: &Path, path: &Path) -> String {
 }
 
 fn markdown_to_document(title: &str, markdown: &str) -> String {
-    let mut options = Options::empty();
-    options.insert(Options::ENABLE_TABLES);
-    options.insert(Options::ENABLE_FOOTNOTES);
-    options.insert(Options::ENABLE_STRIKETHROUGH);
-    options.insert(Options::ENABLE_TASKLISTS);
-
-    let parser = Parser::new_ext(markdown, options);
-    let mut body = String::new();
-    html::push_html(&mut body, parser);
+    let body = markdown_to_html(markdown);
 
     format!(
         "\
@@ -497,8 +490,11 @@ pre {{
 code, pre {{
   font-family: ui-monospace, SFMono-Regular, Consolas, \"Liberation Mono\", monospace;
 }}
-img {{
+img, svg {{
   max-width: 100%;
+}}
+svg {{
+  height: auto;
 }}
 table {{
   border-collapse: collapse;
@@ -506,6 +502,17 @@ table {{
 td, th {{
   border: 1px solid color-mix(in srgb, CanvasText 25%, transparent);
   padding: 0.35rem 0.55rem;
+}}
+.mermaid-diagram {{
+  margin: 1.5rem 0;
+  overflow-x: auto;
+}}
+.mermaid-diagram-error {{
+  border-left: 0.25rem solid color-mix(in srgb, CanvasText 50%, transparent);
+  padding-left: 1rem;
+}}
+.mermaid-diagram-error pre {{
+  margin-bottom: 0;
 }}
 </style>
 </head>
@@ -516,6 +523,112 @@ td, th {{
 ",
         escape_html(title),
         body
+    )
+}
+
+fn markdown_to_html(markdown: &str) -> String {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+
+    let parser = Parser::new_ext(markdown, options);
+    let renderer = HeadlessRenderer::new();
+    let events = render_mermaid_blocks(parser, &renderer);
+    let mut body = String::new();
+    html::push_html(&mut body, events.into_iter());
+
+    body
+}
+
+#[derive(Debug)]
+struct MermaidBlock {
+    index: usize,
+    source: String,
+}
+
+fn render_mermaid_blocks<'a>(
+    events: impl IntoIterator<Item = Event<'a>>,
+    renderer: &HeadlessRenderer,
+) -> Vec<Event<'static>> {
+    let mut transformed = Vec::new();
+    let mut mermaid_block: Option<MermaidBlock> = None;
+    let mut next_diagram_index = 1;
+
+    for event in events {
+        if mermaid_block.is_some() {
+            match event {
+                Event::End(TagEnd::CodeBlock) => {
+                    let block = mermaid_block
+                        .take()
+                        .expect("checked mermaid block is present");
+                    let html = render_mermaid_figure(renderer, &block.source, block.index);
+                    transformed.push(Event::Html(CowStr::from(html)));
+                }
+                Event::Text(text) => {
+                    mermaid_block
+                        .as_mut()
+                        .expect("checked mermaid block is present")
+                        .source
+                        .push_str(&text);
+                }
+                Event::SoftBreak | Event::HardBreak => {
+                    mermaid_block
+                        .as_mut()
+                        .expect("checked mermaid block is present")
+                        .source
+                        .push('\n');
+                }
+                _ => {}
+            }
+
+            continue;
+        }
+
+        match event {
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
+                if is_mermaid_code_fence(&info) =>
+            {
+                mermaid_block = Some(MermaidBlock {
+                    index: next_diagram_index,
+                    source: String::new(),
+                });
+                next_diagram_index += 1;
+            }
+            event => transformed.push(event.into_static()),
+        }
+    }
+
+    transformed
+}
+
+fn is_mermaid_code_fence(info: &str) -> bool {
+    info.split_whitespace()
+        .next()
+        .is_some_and(|language| language.eq_ignore_ascii_case("mermaid"))
+}
+
+fn render_mermaid_figure(renderer: &HeadlessRenderer, source: &str, index: usize) -> String {
+    let diagram_id = format!("mermaid-diagram-{index}");
+
+    match renderer.render_svg_resvg_safe_sync_with_diagram_id(source, &diagram_id) {
+        Ok(Some(svg)) => format!("<figure class=\"mermaid-diagram\">{svg}</figure>\n"),
+        Ok(None) => render_mermaid_error(source, "no Mermaid diagram detected"),
+        Err(error) => render_mermaid_error(source, &error.to_string()),
+    }
+}
+
+fn render_mermaid_error(source: &str, message: &str) -> String {
+    format!(
+        "\
+<figure class=\"mermaid-diagram mermaid-diagram-error\">
+<p>Mermaid rendering failed: {}</p>
+<pre><code>{}</code></pre>
+</figure>
+",
+        escape_html(message),
+        escape_html(source)
     )
 }
 
@@ -815,6 +928,44 @@ mod tests {
         assert!(html.contains("<title>README.md</title>"));
         assert!(html.contains("<h1>Hello</h1>"));
         assert!(html.contains("<li>item</li>"));
+    }
+
+    #[test]
+    fn renders_mermaid_fences_as_svg_figures() {
+        let html = markdown_to_html(
+            "\
+```mermaid
+flowchart TD
+    A --> B
+```
+",
+        );
+
+        assert!(html.contains("<figure class=\"mermaid-diagram\">"));
+        assert!(html.contains("<svg"));
+        assert!(!html.contains("language-mermaid"));
+    }
+
+    #[test]
+    fn preserves_non_mermaid_fences_as_code_blocks() {
+        let html = markdown_to_html(
+            "\
+```rust
+fn main() {}
+```
+",
+        );
+
+        assert!(html.contains("<pre><code class=\"language-rust\">"));
+        assert!(html.contains("fn main() {}"));
+    }
+
+    #[test]
+    fn detects_mermaid_fence_language_case_insensitively() {
+        assert!(is_mermaid_code_fence("mermaid"));
+        assert!(is_mermaid_code_fence("Mermaid title"));
+        assert!(!is_mermaid_code_fence("rust"));
+        assert!(!is_mermaid_code_fence(""));
     }
 
     fn parse<const N: usize>(args: [&str; N]) -> Result<Args, String> {
