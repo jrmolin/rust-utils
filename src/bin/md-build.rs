@@ -5,7 +5,8 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
-use pulldown_cmark::{html, CowStr, Event, Options, Parser, Tag};
+use merman::render::HeadlessRenderer;
+use pulldown_cmark::{html, CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd};
 
 const DEFAULT_OUTPUT: &str = "md-build.html";
 const USAGE: &str = "\
@@ -233,7 +234,7 @@ fn build_site(root: &Path, output: Option<&Path>) -> Result<Site, String> {
             .expect("page route should exist for each Markdown file")
             .clone();
         let title = page_title(relative);
-        let html = markdown_to_html(&markdown, relative, &route, &resolver);
+        let html = markdown_to_html(&markdown, relative, &route, &resolver)?;
 
         pages.entry(route).or_insert(Page {
             title,
@@ -640,8 +641,54 @@ fn markdown_to_html(
     source: &Path,
     source_route: &str,
     resolver: &LinkResolver<'_>,
-) -> String {
-    let parser = Parser::new_ext(markdown, markdown_options()).map(|event| match event {
+) -> Result<String, String> {
+    let mut parser = Parser::new_ext(markdown, markdown_options());
+    let renderer = HeadlessRenderer::new();
+    let mut events = Vec::new();
+    let mut mermaid_diagrams = 0;
+
+    while let Some(event) = parser.next() {
+        match event {
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
+                if is_mermaid_fence(&info) =>
+            {
+                mermaid_diagrams += 1;
+                let diagram = collect_code_block_text(&mut parser);
+                let diagram_id = mermaid_diagram_id(source_route, mermaid_diagrams);
+                let html =
+                    render_mermaid_html(&renderer, &diagram, &diagram_id).map_err(|error| {
+                        format!(
+                            "failed to render Mermaid diagram {} in {}: {error}",
+                            mermaid_diagrams,
+                            source.display()
+                        )
+                    })?;
+
+                events.push(Event::Html(CowStr::Boxed(html.into_boxed_str())));
+            }
+            event => events.push(rewrite_reference_event(
+                event,
+                source,
+                source_route,
+                resolver,
+            )),
+        }
+    }
+
+    let mut body = String::new();
+
+    html::push_html(&mut body, events.into_iter());
+    ensure_mermaid_rendered(mermaid_diagrams, &body, source)?;
+    Ok(body)
+}
+
+fn rewrite_reference_event<'a>(
+    event: Event<'a>,
+    source: &Path,
+    source_route: &str,
+    resolver: &LinkResolver<'_>,
+) -> Event<'a> {
+    match event {
         Event::Start(Tag::Link {
             link_type,
             dest_url,
@@ -679,11 +726,91 @@ fn markdown_to_html(
             })
         }
         _ => event,
-    });
-    let mut body = String::new();
+    }
+}
 
-    html::push_html(&mut body, parser);
-    body
+fn is_mermaid_fence(info: &str) -> bool {
+    info.split_whitespace()
+        .next()
+        .is_some_and(|language| language.eq_ignore_ascii_case("mermaid"))
+}
+
+fn collect_code_block_text<'a>(parser: &mut impl Iterator<Item = Event<'a>>) -> String {
+    let mut text = String::new();
+
+    for event in parser {
+        match event {
+            Event::End(TagEnd::CodeBlock) => break,
+            Event::Text(value)
+            | Event::Code(value)
+            | Event::Html(value)
+            | Event::InlineHtml(value) => text.push_str(&value),
+            Event::SoftBreak | Event::HardBreak => text.push('\n'),
+            _ => {}
+        }
+    }
+
+    text
+}
+
+fn mermaid_diagram_id(source_route: &str, index: usize) -> String {
+    format!("md-build-{source_route}-{index}")
+}
+
+fn render_mermaid_html(
+    renderer: &HeadlessRenderer,
+    diagram: &str,
+    diagram_id: &str,
+) -> Result<String, String> {
+    let diagram = diagram.trim();
+
+    if diagram.is_empty() {
+        return Err("empty Mermaid diagram".to_string());
+    }
+
+    let svg = renderer
+        .render_svg_resvg_safe_sync_with_diagram_id(diagram, diagram_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "renderer did not detect a Mermaid diagram".to_string())?;
+
+    ensure_mermaid_svg(&svg)?;
+    Ok(format!(
+        "<figure class=\"mermaid-diagram\">{svg}</figure>\n"
+    ))
+}
+
+fn ensure_mermaid_svg(svg: &str) -> Result<(), String> {
+    let trimmed = svg.trim_start();
+
+    if !trimmed.starts_with("<svg") || !trimmed.contains("</svg>") {
+        return Err("renderer returned output that is not an SVG image".to_string());
+    }
+
+    Ok(())
+}
+
+fn ensure_mermaid_rendered(expected: usize, html: &str, source: &Path) -> Result<(), String> {
+    if expected == 0 {
+        return Ok(());
+    }
+
+    let rendered = html.matches("class=\"mermaid-diagram\"").count();
+
+    if rendered != expected {
+        return Err(format!(
+            "expected {expected} Mermaid diagram(s) in {} but generated HTML contains {rendered}",
+            source.display()
+        ));
+    }
+
+    if html.contains("language-mermaid") {
+        return Err(format!(
+            "Mermaid code block was emitted instead of rendered in {}",
+            source.display()
+        ));
+    }
+
+    Ok(())
 }
 
 fn markdown_options() -> Options {
@@ -826,7 +953,14 @@ fn site_to_document(site: &Site) -> String {
 }
 
 fn write_site_data(output: &mut String, site: &Site) {
-    output.push_str("const MD_BUILD = {\n  pages: {\n");
+    let default_route = site.pages.keys().next().map(String::as_str).unwrap_or("/");
+
+    writeln!(
+        output,
+        "const MD_BUILD = {{\n  defaultRoute: {},\n  pages: {{",
+        js_string(default_route)
+    )
+    .unwrap();
 
     for (route, page) in &site.pages {
         write!(
@@ -945,8 +1079,7 @@ body {
 }
 
 .content {
-  margin: 0 auto;
-  max-width: 84ch;
+  margin: 0;
   min-width: 0;
   padding: 2.25rem;
   width: 100%;
@@ -957,6 +1090,17 @@ body {
 }
 
 .content img {
+  max-width: 100%;
+}
+
+.mermaid-diagram {
+  margin: 1.5rem 0;
+  overflow-x: auto;
+}
+
+.mermaid-diagram svg {
+  display: block;
+  height: auto;
   max-width: 100%;
 }
 
@@ -1034,7 +1178,7 @@ function escapeHtml(value) {
 }
 
 function parseHash() {
-  let hash = window.location.hash.slice(1) || "/";
+  let hash = window.location.hash.slice(1);
   let fragment = "";
   const fragmentIndex = hash.indexOf("#");
 
@@ -1052,7 +1196,11 @@ function parseHash() {
   try {
     hash = decodeURI(hash);
   } catch (_) {
-    hash = "/";
+    hash = "";
+  }
+
+  if (!hash) {
+    return { path: MD_BUILD.defaultRoute || "/", fragment };
   }
 
   if (!hash.startsWith("/")) {
@@ -1061,7 +1209,7 @@ function parseHash() {
 
   hash = hash.replace(/\/{2,}/g, "/");
 
-  return { path: hash || "/", fragment };
+  return { path: hash, fragment };
 }
 
 function resolveRoute(path) {
@@ -1294,6 +1442,34 @@ mod tests {
     }
 
     #[test]
+    fn renders_mermaid_code_fences_as_svg_images() {
+        let fixture = Fixture::new("mermaid-svg");
+        fixture.write(
+            "README.md",
+            "# Diagram\n\n```mermaid\nflowchart TD\n  A[Start] --> B[Done]\n```\n",
+        );
+
+        let site = build_site(&fixture.root, None).unwrap();
+        let page = site.pages.get("/").unwrap();
+
+        assert!(page.html.contains("class=\"mermaid-diagram\""));
+        assert!(page.html.contains("<svg"));
+        assert!(page.html.contains("</svg>"));
+        assert!(!page.html.contains("language-mermaid"));
+    }
+
+    #[test]
+    fn rejects_mermaid_code_fences_that_do_not_render() {
+        let fixture = Fixture::new("bad-mermaid");
+        fixture.write("README.md", "```mermaid\n\n```\n");
+
+        let error = build_site(&fixture.root, None).unwrap_err();
+
+        assert!(error.contains("failed to render Mermaid diagram 1 in README.md"));
+        assert!(error.contains("empty Mermaid diagram"));
+    }
+
+    #[test]
     fn rewrites_markdown_links_to_hash_routes() {
         let fixture = Fixture::new("link-routes");
         fixture.write("README.md", "[Install](guide/install.md)\n");
@@ -1348,6 +1524,30 @@ mod tests {
         assert!(document.contains("<script>"));
         assert!(document.contains("const MD_BUILD = {"));
         assert!(document.contains("\\u003ch1\\u003eHello\\u003c/h1\\u003e"));
+    }
+
+    #[test]
+    fn records_single_non_root_page_as_default_route() {
+        let fixture = Fixture::new("single-default-route");
+        fixture.write("guide.md", "# Guide\n");
+
+        let site = build_site(&fixture.root, None).unwrap();
+        let document = site_to_document(&site);
+
+        assert!(document.contains("defaultRoute: \"/guide\""));
+        assert!(APP_JS.contains("return { path: MD_BUILD.defaultRoute || \"/\", fragment };"));
+    }
+
+    #[test]
+    fn records_first_page_as_default_route() {
+        let fixture = Fixture::new("first-default-route");
+        fixture.write("zeta.md", "# Zeta\n");
+        fixture.write("alpha.md", "# Alpha\n");
+
+        let site = build_site(&fixture.root, None).unwrap();
+        let document = site_to_document(&site);
+
+        assert!(document.contains("defaultRoute: \"/alpha\""));
     }
 
     #[test]
